@@ -158,6 +158,7 @@ bam_index_t *bam_index_core(bamFile fp)
 	int32_t last_coor, last_tid, save_tid;
 	bam1_core_t *c;
 	uint64_t save_off, last_off, n_mapped, n_unmapped, off_beg, off_end, n_no_coor;
+	uint64_t embed_beg, embed_end;
 
 	h = bam_header_read(fp);
 	if(h == 0) {
@@ -170,7 +171,6 @@ bam_index_t *bam_index_core(bamFile fp)
 	c = &b->core;
 
 	idx->n = h->n_targets;
-	bam_header_destroy(h);
 	idx->index = (khash_t(i)**)calloc(idx->n, sizeof(void*));
 	for (i = 0; i < idx->n; ++i) idx->index[i] = kh_init(i);
 	idx->index2 = (bam_lidx_t*)calloc(idx->n, sizeof(bam_lidx_t));
@@ -179,6 +179,7 @@ bam_index_t *bam_index_core(bamFile fp)
 	save_off = last_off = bam_tell(fp); last_coor = 0xffffffffu;
 	n_mapped = n_unmapped = n_no_coor = off_end = 0;
 	off_beg = off_end = bam_tell(fp);
+	embed_beg = embed_end = 0;
 	while ((ret = bam_read1(fp, b)) >= 0) {
 		if (c->tid < 0) ++n_no_coor;
 		if (last_tid < c->tid || (last_tid >= 0 && c->tid < 0)) { // change of chromosomes
@@ -201,8 +202,10 @@ bam_index_t *bam_index_core(bamFile fp)
 				off_end = last_off;
 				insert_offset(idx->index[save_tid], BAM_MAX_BIN, off_beg, off_end);
 				insert_offset(idx->index[save_tid], BAM_MAX_BIN, n_mapped, n_unmapped);
+				insert_offset(idx->index[save_tid], BAM_MAX_BIN, embed_beg, embed_end);
 				n_mapped = n_unmapped = 0;
 				off_beg = off_end;
+				embed_beg = embed_end = 0;
 			}
 			save_off = last_off;
 			save_bin = last_bin = c->bin;
@@ -214,15 +217,32 @@ bam_index_t *bam_index_core(bamFile fp)
 					(unsigned long long)bam_tell(fp), (unsigned long long)last_off);
 			return NULL;
 		}
-		if (c->flag & BAM_FUNMAP) ++n_unmapped;
-		else ++n_mapped;
+		if (!(c->flag & BAM_FUNMAP)) {
+			/* Expect most reads to be mapped */
+			++n_mapped;
+	       	} else if (c->flag == 516 && c->pos == 0 && c->tid >= 0 &&
+			   strcmp(bam1_qname(b), h->target_name[c->tid]) == 0) {
+			/* For an embedded reference, QNAME matches RNAME, POS is 1 (or 0 in BAM),
+			   and FLAG is 516 (filtered and unmapped); Should only have one per ref! */
+			fprintf(stderr, "[bam_index_core] Found embedded reference '%s'!\n", bam1_qname(b));
+			if (embed_beg != 0 || embed_end != 0) {
+				fprintf(stderr, "[bam_index_core] ERROR. Repeated embedded reference '%s'!\n", bam1_qname(b));
+				return NULL;
+			}
+			embed_beg = last_off;
+			embed_end = bam_tell(fp);
+			/* Note we do not increment n_mapped or n_unmapped, this way putting 1 in
+			   the idxstats output gives a sensible grand total. */
+		} else ++n_unmapped;
 		last_off = bam_tell(fp);
 		last_coor = b->core.pos;
 	}
+        bam_header_destroy(h);
 	if (save_tid >= 0) {
 		insert_offset(idx->index[save_tid], save_bin, save_off, bam_tell(fp));
 		insert_offset(idx->index[save_tid], BAM_MAX_BIN, off_beg, bam_tell(fp));
 		insert_offset(idx->index[save_tid], BAM_MAX_BIN, n_mapped, n_unmapped);
+		insert_offset(idx->index[save_tid], BAM_MAX_BIN, embed_beg, embed_end);
 	}
 	merge_chunks(idx);
 	fill_missing(idx);
@@ -527,6 +547,13 @@ int bam_idxstats(int argc, char *argv[])
 	int i;
 	if (argc < 2) {
 		fprintf(stderr, "Usage: samtools idxstats <in.bam>\n");
+		fprintf(stderr, "\n");
+		fprintf(stderr, "Ouput columns are reference name, length, number of reads mapped, number\n");
+		fprintf(stderr, "reads placed but unmapped, and if there is an embedded reference. The final\n");
+		fprintf(stderr, "line represents unmapped reads not placed against any specific reference.\n");
+		fprintf(stderr, "\n");
+		fprintf(stderr, "The embedded reference information requires a BAM index (*.bai file) created\n");
+		fprintf(stderr, "with samtools 0.0.19 or later. Otherwise '?' is shown in this column.\n\n");
 		return 1;
 	}
 	fp = bam_open(argv[1], "r");
@@ -540,12 +567,18 @@ int bam_idxstats(int argc, char *argv[])
 		khash_t(i) *h = idx->index[i];
 		printf("%s\t%d", header->target_name[i], header->target_len[i]);
 		k = kh_get(i, h, BAM_MAX_BIN);
+		/* 0 = mapped read offsets, 1 = mapped/unmapped counts, 2 = embedded ref offsets */
 		if (k != kh_end(h))
 			printf("\t%llu\t%llu", (long long)kh_val(h, k).list[1].u, (long long)kh_val(h, k).list[1].v);
 		else printf("\t0\t0");
+		/* Final column is 0 for no embedded read, 1 for an embedded read,
+		   using ? if unknown (old bai file lacking this information) */
+		if (kh_val(h, k).n < 2) printf("\t?");
+		else if (kh_val(h, k).list[2].u && kh_val(h, k).list[2].u) printf("\t1");
+		else printf("\t0");
 		putchar('\n');
 	}
-	printf("*\t0\t0\t%llu\n", (long long)idx->n_no_coor);
+	printf("*\t0\t0\t%llu\t0\n", (long long)idx->n_no_coor);
 	bam_header_destroy(header);
 	bam_index_destroy(idx);
 	return 0;
