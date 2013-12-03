@@ -1445,8 +1445,11 @@ int main_stats(int argc, char *argv[])
     else
     {
         // Stream through the entire BAM ignoring off-target regions if -t is given
-        while (samread(sam,bam_line) >= 0) 
+        int r;
+        while ((r = samread(sam,bam_line)) >= 0) 
             collect_stats(bam_line,stats);
+        if (r < -1)
+            error("truncated file.\n");
     }
     round_buffer_flush(stats,-1);
 
